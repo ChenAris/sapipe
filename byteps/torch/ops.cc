@@ -97,11 +97,18 @@ void StartTask(::torch::Tensor tensor, ::torch::Tensor output, int average,
 }
 
 int DoPushPull(::torch::Tensor tensor, ::torch::Tensor output, int average,
-               const std::string& name, int version, int priority) {
+               const std::string& name, int version, int priority, int staleness) {
   ThrowIfError(common::CheckInitialized());
 
   auto handle = handle_manager.AllocateHandle();
-  std::string tensor_name = GetOpName("byteps", name.c_str(), 0);
+  std::string tensor_name;
+  if (staleness == 0) {
+    tensor_name = GetOpName("byteps", name.c_str(), 0);
+  } else {
+    std::string tmp_name = "byteps_version_" + std::to_string(version);
+    tensor_name = GetOpName(tmp_name, name.c_str(), 0);
+  }
+
   auto& context = common::GetContextFromName(tensor_name);
   if (context.initialized) {
     StartTask(tensor, output, average, tensor_name, version, priority, handle);
@@ -121,9 +128,23 @@ void SetNumGrads(int num_grads) {
 
 int PollHandle(int handle) { return handle_manager.PollHandle(handle) ? 1 : 0; }
 
-void DeclareTensor(const std::string& name) {
-  std::string tensor_name = GetOpName("byteps", name.c_str(), 0);
-  common::IsTensorDeclared(tensor_name);
+// void DeclareTensor(const std::string& name) {
+//   std::string tensor_name = GetOpName("byteps", name.c_str(), 0);
+//   common::IsTensorDeclared(tensor_name);
+// }
+
+void DeclareTensor(const std::string& name, int staleness) {
+  int num_versions = staleness + 1;
+  if (num_versions == 1) {
+    std::string tensor_name = GetOpName("byteps", name.c_str(), 0);
+    common::IsTensorDeclared(tensor_name);
+  } else {
+    for (int i=0; i < num_versions; ++i) {
+      std::string tmp_name = "byteps_version_" + std::to_string(i);
+      std::string tensor_name = GetOpName(tmp_name, name.c_str(), 0);
+      common::IsTensorDeclared(tensor_name);
+    }
+  }
 }
 
 void WaitAndClear(int handle) {

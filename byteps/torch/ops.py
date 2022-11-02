@@ -66,21 +66,26 @@ def _push_pull_function_factory(tensor):
 def _push_pull_group_function_factory(tensor):
     return 'byteps_torch_push_pull_group_sync_' + tensor.type().replace('.', '_')
 
-def _do_push_pull_async(tensor, output, average, name, version=0, priority=0):
-    c_lib.byteps_torch_declare_tensor(name.encode() if name is not None else _NULL)
+def _do_push_pull_async(tensor, output, average, name, version=0, priority=0, staleness=0):
+    if staleness != 0:
+        version = version % (staleness + 1)
+    c_lib.byteps_torch_declare_tensor(name.encode() if name is not None else _NULL, staleness)
     function = _check_function(_push_pull_function_factory, tensor)
     handle = getattr(c_lib, function)(tensor, output, average,
                                       name.encode() if name is not None else _NULL,
-                                      version, priority)
+                                      version, priority, staleness)
     _handle_map[handle] = (tensor, output)
     return handle
 
-def _do_push_pull_group_sync(tensor, output, average, name, version=0, priority=0):
-    c_lib.byteps_torch_declare_tensor(name.encode() if name is not None else _NULL)
+def _do_push_pull_group_sync(tensor, output, average, name, version=0, priority=0, staleness=0):
+    if staleness != 0:
+        version = version % (staleness + 1)
+    c_lib.byteps_torch_declare_tensor(name.encode() if name is not None else _NULL, staleness)
+
     function = _check_function(_push_pull_group_function_factory, tensor)
     handle, curr_count = getattr(c_lib, function)(tensor, output, average,
                                       name.encode() if name is not None else _NULL,
-                                      version, priority)
+                                      version, priority, staleness)
     _handle_map[handle] = (tensor, output)
     return handle, curr_count
 
@@ -103,7 +108,7 @@ def push_pull_async(tensor, average=True, name=None, version=0, priority=0):
         `synchronize()`.
     """
     output = tensor.new(tensor.shape)
-    return _do_push_pull_async(tensor, output, average, name, version, priority)
+    return _do_push_pull_async(tensor, output, average, name, version, priority, staleness=0)
 
 
 class BytePSPushPull(torch.autograd.Function):
@@ -154,7 +159,7 @@ def push_pull(tensor, average=True, name=None, version=0, priority=0, compressio
     return compression.decompress(summed_tensor_compressed, ctx)
 
 
-def push_pull_async_inplace(tensor, average=True, name=None, version=0, priority=0):
+def push_pull_async_inplace(tensor, average=True, name=None, version=0, priority=0, staleness=0):
     """
     A function that performs asynchronous in-place averaging or summation of the input
     tensor over all the BytePS processes.
@@ -171,12 +176,12 @@ def push_pull_async_inplace(tensor, average=True, name=None, version=0, priority
         A handle to the push_pull operation that can be used with `poll()` or
         `synchronize()`.
     """
-    return _do_push_pull_async(tensor, tensor, average, name, version, priority)
+    return _do_push_pull_async(tensor, tensor, average, name, version, priority, staleness)
 
-def push_pull_group_sync_inplace(tensor, average=True, name=None, version=0, priority=0):
-    return _do_push_pull_group_sync(tensor, tensor, average, name, version, priority)
+def push_pull_group_sync_inplace(tensor, average=True, name=None, version=0, priority=0, staleness=0):
+    return _do_push_pull_group_sync(tensor, tensor, average, name, version, priority, staleness)
 
-def push_pull_inplace(tensor, average=True, name=None, version=0, priority=0):
+def push_pull_inplace(tensor, average=True, name=None, version=0, priority=0, staleness=0):
     """
     A function that performs in-place averaging or summation of the input tensor over
     all the BytePS processes.
@@ -193,7 +198,7 @@ def push_pull_inplace(tensor, average=True, name=None, version=0, priority=0):
         A tensor of the same shape and type as `tensor`, averaged or summed across all
         processes.
     """
-    handle = push_pull_async_inplace(tensor, average, name, version, priority)
+    handle = push_pull_async_inplace(tensor, average, name, version, priority, staleness)
     return synchronize(handle)
 
 
@@ -211,8 +216,8 @@ def poll(handle):
     return c_lib.byteps_torch_poll(handle) != 0
 
 
-def declare(name):
-    c_lib.byteps_torch_declare_tensor(name.encode())
+def declare(name, staleness=0):
+    c_lib.byteps_torch_declare_tensor(name.encode(), staleness)
     return 0
 
 def byteps_torch_set_num_grads(num_grads_):
