@@ -23,25 +23,72 @@ from contextlib import contextmanager
 from byteps.torch.compression import Compression
 from byteps.torch.ops import push_pull_async_inplace as byteps_push_pull
 from byteps.torch.ops import push_pull
+from byteps.torch.ops import batched_fuse_, batched_unfuse_, batched_zero_
+from byteps.torch.ops import byteps_torch_set_num_grads
 from byteps.torch.ops import poll, synchronize, declare
 from byteps.torch.ops import init, shutdown, suspend, resume
 from byteps.torch.ops import size, local_size, rank, local_rank
+from byteps.torch.ops import send_async, recv_async
+
 
 import os
 import torch
 import collections
 import io
-import cloudpickle
-
-
+try:
+    import queue
+except ImportError:
+    import Queue as queue
+import logging
+import threading
+import time
+import numpy as np
+#@yrchen: for debug
+cache_time = []
+cache_opt_time = []
+copy_time = []
+step_time = []
+restore_time = []
+total_time = []
 class _DistributedOptimizer(torch.optim.Optimizer):
     def __init__(self, params, named_parameters, compression,
-                 backward_passes_per_step=1, staleness=0):
+                 backward_passes_per_step=1, staleness=0,
+                 pipesgd_warmup_iter=0,
+                 pipesgd_dc_lambda=0,
+                 pipesgd_dc_outerprod=False,
+                 pipesgd_dc_adaptive=False,
+                 pipesgd_dc_adaptive_eps=1e-7,
+                 pipesgd_weight_prediction=None,
+                 partial_stale_layer=0, model=None
+):
         super(self.__class__, self).__init__(params)
         self._compression = compression
         self._niter = 0
         self._staleness = staleness
+        self._pipesgd_warmup_iter = pipesgd_warmup_iter
         assert staleness == 0 or staleness == 1, staleness
+
+        # pipesgd staleness mitigation
+        self._pipesgd_dc_lambda = pipesgd_dc_lambda
+        self._pipesgd_dc_outerprod = pipesgd_dc_outerprod
+        self._pipesgd_dc_adaptive = pipesgd_dc_adaptive
+        self._pipesgd_dc_adaptive_eps = pipesgd_dc_adaptive_eps
+        self._pipesgd_weight_prediction = pipesgd_weight_prediction
+        self._pipesgd_num_cached_weight = 0
+        if staleness == 1:
+            assert pipesgd_dc_lambda >= 0, pipesgd_dc_lambda
+            assert pipesgd_dc_adaptive_eps > 0, pipesgd_dc_adaptive_eps
+            assert pipesgd_weight_prediction in [None, "local", "prev_sync", "local_prev_sync", "prev_sync_dc", "local_prev_sync_dc"], pipesgd_weight_prediction
+            if pipesgd_weight_prediction is not None and self._pipesgd_warmup_iter <= 0:
+                self._pipesgd_warmup_iter = 1
+                print('BytePS: weight prediction requires pipesgd_warmup_iter, so that the optimizer states could be initialized first, pipesgd_warmup_iter is automatically set to 1')
+            if pipesgd_weight_prediction is not None:
+                self._pipesgd_num_cached_weight += 1
+                if pipesgd_weight_prediction.endswith("_dc"):
+                    self._pipesgd_num_cached_weight += 1
+            print('BytePS: weight prediction requires caching the weights in the last %d steps' % (self._pipesgd_num_cached_weight))
+
+
 
         if named_parameters is not None:
             named_parameters = list(named_parameters)
@@ -92,7 +139,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         self._grad_accs = []
         self._requires_update = set()
         self._should_sync = True
-        
+
         # for pipesgd
         self._stale_handles = collections.defaultdict(dict)
         self._stale_push_pull_delay = collections.defaultdict(dict)
@@ -110,12 +157,46 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         # that pipesgd takes effect.
         self.state['byteps_stale_grad'] = {}
 
+        # cache the weight in the previous step
+        self.state['byteps_prev_weight'] = {}
+        # cache the grad and weight for weight prediction
+        self.state['byteps_weight_prediction_local_grad'] = {}
+        self.state['byteps_weight_prediction_sync_grad'] = {}
+        # cache the optimizer state in the previous step
+        self.state['byteps_prev_opt_state'] = {}
+
+
+        self._prev_weight_update_cnt = {}
+
+
+        self._partial_stale_layer = partial_stale_layer if staleness == 1 else 0
+        if self._partial_stale_layer:
+            self._partial_stale_name = self._set_partial_stale_layer_name(partial_stale_layer)
+        
+        self._step = 0
+        self._model = model
+        self._logger = logging.getLogger("SAPipe")
+        self._logger.debug("hvd size {}, rank {}".format(size(), rank()))
+        self._desc = f"rank {rank()}"
+        
+        self._locks = {}
+        for param_group in self.param_groups:
+            for p in param_group['params']:
+                self._locks[p] = threading.Lock()
+        
         if size() > 1:
-            self._register_hooks()
+            if self._partial_stale_layer:
+                self._register_partial_stale_hooks()
+                self._register_forward_hooks()
+                # Poll whether the tensor push-pull is finished.
+                self._event_queue = queue.Queue()
+                #self._poller = threading.Thread(target=self._poll, args=())
+                #self._poller.start()
+            else:
+                self._register_hooks()
 
         # declare tensors
         for name in sorted(self._parameter_names.values()):
-            #declare("Gradient."+name)
             declare("Gradient."+name, staleness=staleness)
         # We use two loops for load-balancing
         for name in sorted(self._parameter_names.values()):
@@ -149,6 +230,107 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                     grad_acc.register_hook(self._make_hook(p))
                     self._grad_accs.append(grad_acc)
 
+    
+    def _register_partial_stale_hooks(self):
+        for param_group in self.param_groups:
+            for p in param_group['params']:
+                if p.requires_grad:
+                    p.grad = p.data.new(p.size()).zero_()
+                    self._requires_update.add(p)
+                    p_tmp = p.expand_as(p)
+                    grad_acc = p_tmp.grad_fn.next_functions[0][0]
+                    # @yrchen: check if this grad is partial-stale
+                    name = self._get_param_name(p)
+                    partial_stale = 1 if self._partial_stale_name.get(name) else 0
+                    if partial_stale:
+                        print(f"Param {name} enables partial staleness!")
+                    grad_acc.register_hook(self._make_hook(p, partial_stale))
+                    self._grad_accs.append(grad_acc)  
+
+    def _poll(self):
+        """Separate thread to poll the completion of the tensor's synchronization 
+        from a FIFA event queue. 
+        TODO: The advantage of separate polling thread over the hook synchronization is 
+        to avoid being blocked by non-prior layers/modules' params.
+        TODO: leave out the stale-param
+        """
+        while True:
+            p, handle, ctx = self._event_queue.get()
+            if p is None:
+                self._logger.debug("poller exists.")
+                break
+            # check whether the push/pull of this tensor is finished
+            # if so, start param updating.
+            if handle is not None and poll(handle):
+                output = synchronize(handle)
+                p.grad.set_(self._compression.decompress(output, ctx))
+                self._logger.debug("{} {} finished push-pull".format(self._desc, self._get_param_name(p)))
+                self._push_pull_delay[p] = self.backward_passes_per_step
+                # So only support SGD, Adam and RMSprop optimizers in torch
+                if isinstance(self.__class__, torch.optim.SGD):
+                    self._sgd(p)
+                else:
+                    self._sgd(p)
+                    #raise ValueError("Invalid optimizer! Only support SGD, Adam and RMSprop.")
+                self._zero_one_grad(p)
+                # notify update completion and parameter is ready for forward propagation
+                if p in self._locks:
+                    self._locks[p].release()
+            else:
+                self._event_queue.put((p, handle, ctx))
+
+    def _register_forward_hooks(self):
+        """@yrchen: Add hook before forward propagation of each layer to block forward computation
+        until the gradient synchronization and parameter update are finished. For non-stale layer, do not
+        synchronize the comm ops.
+        """
+        # Recursively find all submodules
+        submodules = []
+        q = queue.LifoQueue()
+        for mod in self._model.children():
+            q.put(mod)
+        while not q.empty():
+            mod = q.get()
+            if len(list(mod.children())) == 0:
+                submodules.append(mod)
+            else:
+                for m in mod.children():
+                    q.put(m)
+        
+        def pre_forward_hook(mod, input):
+            
+            if mod.training is False:
+                return
+            for p in mod.parameters():
+                name = self._get_param_name(p)
+                #if p in self._handles:
+                #    del self._handles[p]
+                if name in self._partial_stale_name:
+                    #print(f"param {name} no need for update, continue...")
+                    self._sgd(p)
+                    self._zero_one_grad(p)
+                    continue
+                if p not in self._locks:
+                    continue
+                #with self._locks[p]:
+                #    self._logger.debug(f"{self._desc} param {name} is ready.")
+                self._logger.debug(f"{self._desc} param {name} is ready.")
+                
+                self._partial_synchronize(p)
+                self._sgd(p)
+                self._zero_one_grad(p)
+            self._logger.debug(f"{self._desc} starts forward {mod}.")
+
+
+        def after_forward_hook(mod, input, ret):
+            self._logger.debug("{} finished forward {}.".format(self._desc, mod))
+
+        # Register pre-hook and hook for each module
+        for mod in reversed(submodules):
+            self._logger.debug("{} registers forward hook on module {}".format(self._desc, mod))
+            mod.register_forward_pre_hook(pre_forward_hook)
+            mod.register_forward_hook(after_forward_hook)
+
     def _get_param_name(self, p):
         """Get the name of a parameter."""
         if self._is_tensor_instance:
@@ -158,12 +340,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         return name
 
     def _push_pull_grad_async(self, p):
-        #name = self._get_param_name(p)
-
-        if self._is_tensor_instance:
-            name = self._parameter_names.get(p.__hash__())
-        else:
-            name = self._parameter_names.get(p)
+        name = self._get_param_name(p)
         if self._enable_async:
             # the real handle will be created in step()
             handle, ctx = None, None
@@ -171,16 +348,21 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             tensor = p.grad
             tensor_compressed, ctx = self._compression.compress(tensor)
             # pipe-sgd: need to clone the gradient to avoid race condition
-            if self._staleness:
-                tensor_compressed = tensor_compressed.clone()
+            version = 0
             niter = self.state['byteps_niter']
+            if self._staleness and niter >= self._pipesgd_warmup_iter:
+                tensor_compressed = tensor_compressed.clone()
             handle = byteps_push_pull(tensor_compressed, average=True, name="Gradient."+name,
                                       version=niter, staleness=self._staleness)
-        return handle, ctx, name
-#             handle = byteps_push_pull(tensor_compressed, average=True, name="Gradient."+name)
-#         return handle, ctx
 
-    def _make_hook(self, p):
+           
+            if self._partial_stale_layer:
+                if self._partial_stale_name.get(name) is None:
+                    self._event_queue.put((p, handle, ctx))
+        return handle, ctx, name
+
+    
+    def _make_hook(self, p, partial_stale=1):
         def hook(*ignore):
             if p in self._handles and self._handles[p][0] is not None:
                 if self._push_pull_delay[p] <= 0:
@@ -190,10 +372,14 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                         "to step(). Increase backward_passes_per_step to "
                         "accumulate gradients locally.")
             assert not p.grad.requires_grad
-            assert self._push_pull_delay[p] > 0
-            handle, ctx = None, None
+            assert self._push_pull_delay[p] > 0, f"push_pull_delay {self._get_param_name(p)}: {self._push_pull_delay[p]}"
+            handle, ctx, name = None, None, None
             self._push_pull_delay[p] -= 1
+            
             if self._push_pull_delay[p] == 0:
+                if self._partial_stale_layer:
+                    #self._locks[p].acquire()
+                    pass
                 handle, ctx, name = self._push_pull_grad_async(p)
             # FIXME: ``name`` may be undefined
             self._handles[p] = (handle, ctx, name)
@@ -211,10 +397,33 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             handle, ctx = None, None
             self._stale_push_pull_delay[name] -= 1
             if self._stale_push_pull_delay[name] == 0:
+                if self.state['byteps_niter'] >= self._pipesgd_warmup_iter and self._pipesgd_weight_prediction is not None:
+                    # pipe-sgd with weight prediction via latest sync gradient and local gradient replaced: 
+                    # must be done before the local gradient cache is updated
+                    if "local_prev_sync" in self._pipesgd_weight_prediction and name in self.state['byteps_weight_prediction_local_grad']:
+                        if name not in self.state['byteps_weight_prediction_sync_grad']:
+                            self.state['byteps_weight_prediction_sync_grad'][name] = self.state['byteps_weight_prediction_local_grad'][name].clone()
+                        else:
+                            self.state['byteps_weight_prediction_sync_grad'][name].copy_(self.state['byteps_weight_prediction_local_grad'][name])
+                        # sync_grad = - prev_local_grad/n
+                        self.state['byteps_weight_prediction_sync_grad'][name][:] *= (-1.0 / size())
+                    # pipe-sgd with weight prediction via local gradient: cache the local gradient for weight prediction
+                    if "local" in self._pipesgd_weight_prediction:
+                        if name not in self.state['byteps_weight_prediction_local_grad']:
+                            self.state['byteps_weight_prediction_local_grad'][name] = p.grad.clone()
+                        else:
+                            self.state['byteps_weight_prediction_local_grad'][name].copy_(p.grad)
+
                 handle, ctx, name = self._push_pull_grad_async(p)
                 self._stale_handles[niter][name] = (p, handle, ctx)
 
-        return hook if self._staleness == 0 else stale_hook
+        # @yrchen: enable partial-stale hooks
+        if self._staleness == 0:
+            return hook
+        else:
+            return hook if partial_stale == 0 else stale_hook
+
+        #return hook if self._staleness == 0 else stale_hook
 
     def synchronize(self):
         """Synchronizes the asynchronous pushpull(allreduce) operations for all
@@ -227,6 +436,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
 
 
     def _synchronize(self):
+        """Synchronize the pushpull operations"""
         missing_p = self._requires_update - set(self._handles.keys())
         for p in missing_p:
             if type(p.grad) == type(None):
@@ -235,7 +445,6 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             self._handles[p] = (handle, ctx, name)
 
         for p, value in self._handles.items():
-            #handle, ctx = value
             handle, ctx, name = value
             if handle is None:
                 handle, ctx, _ = self._push_pull_grad_async(p)
@@ -250,8 +459,9 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                 else:
                     p.grad.copy_(tmp)
         self._handles.clear()
-        
+
     def _stale_synchronize(self):
+        """Synchronize the pushpull operations when pipesgd is enabled"""
         has_amp = hasattr(self, "_amp_stash")
         niter = self.state['byteps_niter']
         assert niter >= 0, niter
@@ -265,20 +475,29 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         # if the loss scale increases at the current iteration
         # amp will rescale it back after synchronize(). so we need
         # to adjust the gradient from the previous step accordingly
-        prev_loss_scale = self.state['byteps_stale_scale'] if niter > 0 else loss_scale
+        if niter > self._pipesgd_warmup_iter:
+            prev_loss_scale = self.state['byteps_stale_scale']
+        else:
+            prev_loss_scale = loss_scale
         grad_ratio = loss_scale / prev_loss_scale
 
         # materialzed grad tensors are not available. obtain them from handles
         stale_grad_state = self.state['byteps_stale_grad']
         if not stale_grad_state:
-            if niter == 0:
+            if niter <= self._pipesgd_warmup_iter:
+                if niter == self._pipesgd_warmup_iter:
+                    print(f'BytePS pipeSGD: started pipeline at iter {niter}', flush=True)
                 for name, (p, handle, ctx) in self._stale_handles[niter].items():
                     assert handle is not None, name
                     assert not p.grad.is_sparse, "sparse gradient is not supported"
                     output = synchronize(handle)
                     tmp = self._compression.decompress(output, ctx)
-                    stale_grad_state[name] = tmp
-                    p.grad.copy_(tmp)
+                    # sync SGD duration warmup
+                    if niter < self._pipesgd_warmup_iter:
+                        p.grad.data = tmp
+                    else:
+                        stale_grad_state[name] = tmp
+                        p.grad.copy_(tmp)
             else:
                 for name, (p, handle, ctx) in self._stale_handles[niter-1].items():
                     assert handle is not None
@@ -292,7 +511,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                         if grad_ratio != 1.0:
                             prev_grad.mul_(grad_ratio)
                         p.grad.copy_(prev_grad)
-            if niter > 0:
+            if (niter - 1) in self._stale_handles:
                 del self._stale_handles[niter - 1]
         else:
             # grad tensors alread materialized
@@ -306,6 +525,49 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                             prev_grad.mul_(grad_ratio)
                         p.grad.copy_(prev_grad)
             self.state['byteps_stale_grad'] = {}
+        
+        if niter > self._pipesgd_warmup_iter:
+            # delay mitigation if pipesgd is active, first step skipped
+            if self._pipesgd_weight_prediction is None and self._pipesgd_dc_lambda > 0:
+                # delay compensation, if not using weight prediction, and pipesgd is active
+                prev_weight_dict = self.state['byteps_prev_weight']
+                for param_group in self.param_groups:
+                    for p in param_group['params']:
+                        if p.requires_grad:
+                            name = self._get_param_name(p)
+                            if name not in prev_weight_dict:
+                                # in the first iteration where pipesgd is active, gradient has no delay, no need to use dc
+                                prev_weight_dict[name] = [p.data.clone().detach()]
+                            else:
+                                self.delay_compensation(p.grad, p.data, prev_weight_dict[name][-1])
+                                with torch.no_grad():
+                                    # update cache
+                                    prev_weight_dict[name][-1].copy_(p.data)
+        
+        if niter >= self._pipesgd_warmup_iter and self._pipesgd_weight_prediction is not None:
+            # delay mitigation if pipesgd is active
+            if "prev_sync" in self._pipesgd_weight_prediction:
+                # pipe-sgd with weight prediction via latest sync gradient and local gradient replaced: 
+                for group in self.param_groups:
+                    for p in group['params']:
+                        if p.requires_grad:
+                            name = self._get_param_name(p)
+                            prev_sync_grad = p.grad
+                            if "local" in self._pipesgd_weight_prediction:
+                                if name in self.state['byteps_weight_prediction_sync_grad']:
+                                    # sync_grad = - prev_local_grad/n + prev_sync_grad 
+                                    self.state['byteps_weight_prediction_sync_grad'][name][:] += prev_sync_grad
+                                else:
+                                    # sync_grad = prev_sync_grad 
+                                    self.state['byteps_weight_prediction_sync_grad'][name] = prev_sync_grad.clone()
+                            else:
+                                # sync_grad = prev_sync_grad 
+                                if name in self.state['byteps_weight_prediction_sync_grad']:
+                                    self.state['byteps_weight_prediction_sync_grad'][name].copy_(prev_sync_grad)
+                                else:
+                                    self.state['byteps_weight_prediction_sync_grad'][name] = prev_sync_grad.clone()
+
+
 
         # update states
         for name in self._stale_push_pull_delay:
@@ -333,7 +595,6 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         for name in self._stale_push_pull_delay:
             self._stale_push_pull_delay[name] = self.backward_passes_per_step
 
-            
     @contextmanager
     def skip_synchronize(self):
         if self._enable_async:
@@ -372,20 +633,321 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             # skip sync if calling skip_synchronize
             if self._should_sync:
                 self.synchronize()
-            #return super(self.__class__, self).step(closure)
-            if self._staleness == 0:
+            niter = self.state['byteps_niter']
+            # synchronize() already incremented niter by 1
+            pipesgd_active = self._staleness and niter > self._pipesgd_warmup_iter
+            if not pipesgd_active:
                 return super(self.__class__, self).step(closure)
             else:
                 if not self.state['byteps_skipped_init_step']:
                     self.state['byteps_skipped_init_step'] = True
                 else:
-                    return super(self.__class__, self).step(closure)
+                    if self._pipesgd_weight_prediction is not None:
+                        tic = time.time()
+                        self.restore_weight()
+                        if rank() == -1:
+                            print(f"restore weight time: {time.time() - tic:.4f}")
+                    # @yrchen: only apply update when partial-staleness is disabled
+                    if self._partial_stale_layer == 0:
+                        return super(self.__class__, self).step(closure)
+                    else:
+                        # call forward hook to apply update
+                        if self._step == 0:
+                            self._step += 1
+                            self._synchronize()
+                            return super(self.__class__, self).step(closure)
+                        else:
+                            loss = None
+                            if closure is not None:
+                                loss = closure()
+                            self._step += 1
+                            return loss            
+    
+    def partial_step(self, closure=None):
+        """Override the default step function.
+        """
+        self._logger.debug(f"{self._desc} calls step function {self._step}.")
 
+        # Step 0 is called for parameter initialization after parameter broadcast
+        if size() > 1 and self._step > 0:
+            # TODO: finish the partial synchronize
+            self._partial_synchronize()
+            # TODO: if this is the final training step, wait for the completion of all tensors
+            loss = None
+            if closure is not None:
+                loss = closure()
+            self._step += 1
+            return loss
+        else:
+            # Optimizer.step() will be triggered when user calls byteps.broadcast_optimizer_sate()
+            self._step += 1
+            return super(self.__class__, self).step(closure)
+            
+
+    def delay_compensation(self, grad, cur_weight, prev_weight):
+        with torch.no_grad():
+            if self._pipesgd_dc_outerprod:
+                if self._pipesgd_dc_adaptive:
+                    # dc, outerprod, adaptive
+                    grad[:] += (self._pipesgd_dc_lambda * ((torch.sum(grad * (cur_weight - prev_weight)) \
+                        / (torch.sqrt(torch.sum(grad * grad) + self._pipesgd_dc_adaptive_eps))) * grad))
+                else:
+                    # dc, outerprod
+                    grad[:] += self._pipesgd_dc_lambda * (torch.sum(grad * (cur_weight - prev_weight)) * grad)
+            else:
+                if self._pipesgd_dc_adaptive:
+                    # dc, adaptive
+                    grad_square = grad * grad
+                    grad[:] += (self._pipesgd_dc_lambda * (grad_square * (cur_weight - prev_weight) \
+                        / torch.sqrt(grad_square + self._pipesgd_dc_adaptive_eps)))
+                else:
+                    # dc
+                    grad[:] += self._pipesgd_dc_lambda * (grad * grad * (cur_weight - prev_weight))
+    
+    def cache_weight(self):
+        prev_weight_dict = self.state['byteps_prev_weight']
+        src_tensor = []
+        dst_tensor = []
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.requires_grad:
+                    name = self._get_param_name(p)
+                    if name not in prev_weight_dict:
+                        prev_weight_dict[name] = []
+                        self._prev_weight_update_cnt[name] = -1
+                    if len(prev_weight_dict[name]) < self._pipesgd_num_cached_weight:
+                        prev_weight_dict[name].append(p.data.clone().detach())
+                    else:
+                        # discard the oldest weight
+                        #prev_weight_dict[name].append(prev_weight_dict[name].pop(0))
+                        # cache the latest weight
+                        prev_weight_dict[name][-1].copy_(p.data)
+                        self._prev_weight_update_cnt[name] += 1
+                        update_idx = (self._prev_weight_update_cnt[name]) % self._pipesgd_num_cached_weight
+
+        if len(dst_tensor) > 0 and False:
+            torch._foreach_add_(dst_tensor, src_tensor)
+            #pass
+            #copy_tensor_(dst_tensor, src_tensor)
+            return [], []
+        else:
+            pass
+            #print(f"No cache tensor!")
+        return dst_tensor, src_tensor
+    
+    def restore_weight(self):
+        prev_weight_dict = self.state['byteps_prev_weight']
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.requires_grad:
+                    name = self._get_param_name(p)
+                    p.data.copy_(prev_weight_dict[name][-1])
+
+    def restore_weight_v2(self):
+        prev_weight_dict = self.state['byteps_prev_weight']
+        for group in self.param_groups:
+            grads = []
+            params_wigh_grad = []
+            for p in group['params']:
+                if p.requires_grad:
+                    name = self._get_param_name(p)
+                    update_idx = (self._prev_weight_update_cnt[name]) % self._pipesgd_num_cached_weight
+                    grads.append(prev_weight_dict[name][update_idx])
+                    params_wigh_grad.append(p.data)
+            
+            torch._foreach_add_(params_wigh_grad, grads)
+ 
+    def cache_optimizer_state(self):
+        src_tensor = []
+        dst_tensor = []
+        prev_opt_state_dict = self.state['byteps_prev_opt_state']
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.requires_grad:
+                    name = self._get_param_name(p)
+                    state = self.state[p]
+                    if name not in prev_opt_state_dict:
+                        prev_opt_state_dict[name] = dict()
+                    prev_opt_state = prev_opt_state_dict[name]
+                    for k, v in state.items():
+                        if torch.is_tensor(v):
+                            if k not in prev_opt_state:
+                                prev_opt_state[k] = v.clone()
+                            else:
+                                prev_opt_state[k].copy_(v)
+                                #src_tensor.append(v)
+                                #dst_tensor.append(prev_opt_state[k])
+                        else:
+                            prev_opt_state[k] = state[k]
+           
+        if len(dst_tensor) > 0:
+            torch._foreach_add_(dst_tensor, src_tensor)
+
+    def restore_optimizer_state(self):
+        src_tensor = []
+        dst_tensor = []
+        prev_opt_state_dict = self.state['byteps_prev_opt_state']
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.requires_grad:
+                    name = self._get_param_name(p)
+                    state = self.state[p]
+                    prev_opt_state = prev_opt_state_dict[name]
+                    for k, v in state.items():
+                        if torch.is_tensor(v):
+                            v.copy_(prev_opt_state[k])
+                        else:
+                            state[k] = prev_opt_state[k]
+        # FIXME 
+        if len(dst_tensor) > 0:
+            torch._foreach_add_(dst_tensor, src_tensor)
+
+    def shadow_step(self):
+        if self._pipesgd_weight_prediction is not None and self.state['byteps_skipped_init_step']:
+            # cache the weight and optimizer state
+            step_tic = time.time()
+            self.cache_weight()
+            cache_tac = time.time()
+            self.cache_optimizer_state()
+            op_state_tac = time.time()
+            # use the estimated gradient to execute 1 optimizer step ahead
+            src_tensor = []
+            dst_tensor = []
+            for group in self.param_groups:
+                for p in group['params']:
+                    if p.requires_grad:
+                        name = self._get_param_name(p)
+                        # dc
+                        if self._pipesgd_weight_prediction.endswith("_dc") \
+                            and name in self.state['byteps_weight_prediction_sync_grad'] \
+                            and len(self.state['byteps_prev_weight'][name]) >= 2:
+                            self.delay_compensation(self.state['byteps_weight_prediction_sync_grad'][name], \
+                                                    self.state['byteps_prev_weight'][name][-1], \
+                                                    self.state['byteps_prev_weight'][name][-2])
+                        if "local" in self._pipesgd_weight_prediction:
+                            # weight prediction using local gradient
+                            p.grad.copy_(self.state['byteps_weight_prediction_local_grad'][name])
+
+                            if "prev_sync" in self._pipesgd_weight_prediction \
+                                and name in self.state['byteps_weight_prediction_sync_grad'] \
+                                and self.state['byteps_niter'] > self._pipesgd_warmup_iter + 1:
+                                # grad = cur_local_grad/n - prev_local_grad/n + prev_avg_grad 
+                                p.grad[:] /= size()
+                                p.grad[:] += self.state['byteps_weight_prediction_sync_grad'][name]
+                        else:
+                            if name in self.state['byteps_weight_prediction_sync_grad']:
+                                # weight prediction using prev_sync_grad
+                                p.grad.copy_(self.state['byteps_weight_prediction_sync_grad'][name])
+                            else:
+                                # weight prediction using local gradient temporarily, if byteps_weight_prediction_sync_grad is not ready
+                                p.grad.copy_(self.state['byteps_weight_prediction_local_grad'][name])
+            copy_tac = time.time()
+            ret = super(self.__class__, self).step()
+            step_tac = time.time()
+            self.restore_optimizer_state()
+            restore_tac = time.time()
+            return ret
+
+    
+    def _set_partial_stale_layer_name(self, partial_stale_layer=2):
+        print(f"parameter_names: {self._parameter_names}")
+        param_names = self._parameter_names
+        partial_stale_name = {}
+        for i in range(partial_stale_layer):
+            # for VGG16 model
+            layer_index = "." +  str(i) + "."
+            for param_group in self.param_groups:
+                for p in param_group['params']:
+                    if p.requires_grad:
+                        name = self._get_param_name(p)
+                        if layer_index in name:
+                            partial_stale_name[name] = 1
+        print(f"Get partial stale layer name {partial_stale_layer}: {partial_stale_name}")
+        return partial_stale_name
+
+    def _zero_one_grad(self, p):
+        """Clears the gradient of one variable as torch accumulates gradients by default.
+        Arguments:
+            p: the parameter.
+        """
+        if p.grad is not None:
+            p.grad.detach_()
+            p.grad.zero_()
+
+    def _partial_synchronize(self, p):
+        """synchronize function for partial staleness mode
+        """
+        # this may have been done in grad hooks
+        if self._handles.get(p) is None:
+            print(f"no handles for param {self._get_param_name(p)}")
+            return None
+        value = self._handles.pop(p)
+        handle, ctx, name = value
+        print(f"synchronizing for param {self._get_param_name(p)}")
+        output = synchronize(handle)
+        #if p in self._locks:
+        #    self._locks[p].release()
+        self._push_pull_delay[p] = self.backward_passes_per_step
+        print(f"Reset param {self._get_param_name(p)} delay to 1.")
+        if not self._enable_async:
+            tmp = output
+            if self._compression == Compression.none:
+                p.grad.set_(tmp)
+            else:
+                p.grad.copy_(tmp)
+
+        #del self._handles[p]
+
+    @torch.no_grad()
+    def _sgd(self, p):
+        """Perform a single update step using SGD optimizer on a parameter.
+        Argumetns:
+            p: the parameter to be updated.
+        """
+        for group in self.param_groups:
+            weight_decay = group['weight_decay']
+            momentum = group['momentum']
+            dampening = group['dampening']
+            nesterov = group['nesterov']
+            #TODO
+            for gp in group['params']:
+                #if self._parameter_names[p] != self._parameter_names[gp] or gp.shape != p.shape:
+                if self._get_param_name(p) != self._get_param_name(gp) or gp.shape != p.shape:
+                    continue
+                self._logger.debug("{} is updating {}".format(self._desc, self._get_param_name(p)))
+                if p.grad is None:
+                    continue
+                d_p = p.grad.data
+                if weight_decay != 0:
+                    d_p.add_(weight_decay, p.data)
+                if momentum != 0:
+                    param_state = self.state[p]
+                    if 'momentum_buffer' not in param_state:
+                        buf = param_state['momentum_buffer'] = torch.zeros_like(p.data)
+                        buf.mul_(momentum).add_(d_p)
+                    else:
+                        buf = param_state['momentum_buffer']
+                        buf.mul_(momentum).add_(1 - dampening, d_p)
+                    if nesterov:
+                        d_p = d_p.add(momentum, buf)
+                    else:
+                        d_p = buf
+                #p.data.add_(-group['lr'], d_p)
+                p.data.add_(d_p, alpha=-group['lr'])
+                break
 
 
 def DistributedOptimizer(optimizer, named_parameters=None,
                          compression=Compression.none,
-                         backward_passes_per_step=1, staleness=0):
+                         backward_passes_per_step=1, staleness=0,
+                         pipesgd_warmup_iter=0,
+                         pipesgd_dc_lambda=0,
+                         pipesgd_dc_outerprod=False,
+                         pipesgd_dc_adaptive=False,
+                         pipesgd_dc_adaptive_eps=1e-7,
+                         pipesgd_weight_prediction=None,
+                         partial_stale_layer=0, model=None
+):
     """
     An optimizer that wraps another torch.optim.Optimizer, using an push_pull to
     average gradient values before applying gradients to model weights.
@@ -395,7 +957,9 @@ def DistributedOptimizer(optimizer, named_parameters=None,
     DistributedOptimizer exposes the `synchronize()` method, which forces push_pull operations
     to finish before continuing the execution. It's useful in conjunction with gradient
     clipping, or other operations that modify gradients in place before `step()` is executed.
+
     Example of gradient clipping:
+
     ```
     output = model(data)
     loss = F.nll_loss(output, target)
@@ -404,6 +968,7 @@ def DistributedOptimizer(optimizer, named_parameters=None,
     torch.nn.utils.clip_grad_norm(model.parameters(), args.clip)
     optimizer.step()
     ```
+
     Arguments:
         optimizer: Optimizer to use for computing gradients and applying updates.
         named_parameters: A mapping between parameter names and values. Used for naming of
@@ -416,13 +981,25 @@ def DistributedOptimizer(optimizer, named_parameters=None,
                                   allows accumulating gradients over multiple
                                   mini-batches before executing averaging and
                                   applying them.
+        staleness: Number of controlled gradients staleness if pipelined SGD is enabled. 
+                   This allows optimizer using stale gradients to update parameters. Defaults 
+                   to not using pipelined SGD, i.e., staleness=0. If set to 1, the parameter
+                   update is delayed by 1 step. Reference: https://arxiv.org/abs/1811.03619
+        pipesgd_warmup_iter: Number of warmup steps for pipesgd, during which pipesgd staleness
+                   is fixed at 0.
     """
     # We dynamically create a new class that inherits from the optimizer that was passed in.
     # The goal is to override the `step()` method with an push_pull implementation.
     cls = type(optimizer.__class__.__name__, (optimizer.__class__,),
                dict(_DistributedOptimizer.__dict__))
     return cls(optimizer.param_groups, named_parameters,
-               compression, backward_passes_per_step, staleness)
+               compression, backward_passes_per_step,
+               staleness=staleness, pipesgd_warmup_iter=pipesgd_warmup_iter,
+               pipesgd_dc_lambda=pipesgd_dc_lambda, pipesgd_dc_outerprod=pipesgd_dc_outerprod,
+               pipesgd_dc_adaptive=pipesgd_dc_adaptive, pipesgd_dc_adaptive_eps=pipesgd_dc_adaptive_eps,
+               pipesgd_weight_prediction=pipesgd_weight_prediction,
+               partial_stale_layer=partial_stale_layer, model=model
+)
 
 
 def broadcast_parameters(params, root_rank, prefix="Parameter."):
@@ -603,6 +1180,8 @@ def broadcast_object(obj, root_rank=0, name=None):
     Returns:
         The object that was broadcast from the `root_rank`.
     """
+    import cloudpickle
+
     if name is None:
         name = type(obj).__name__
 
@@ -624,3 +1203,4 @@ def broadcast_object(obj, root_rank=0, name=None):
         obj = cloudpickle.load(buf)
 
     return obj
+
